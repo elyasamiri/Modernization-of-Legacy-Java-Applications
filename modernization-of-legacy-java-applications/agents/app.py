@@ -1,0 +1,433 @@
+# app.py - web backend for the Modernization Control Panel dashboard
+#
+# This is the server-side component that powers the dashboard UI. It's intentionally
+# lightweight - no database, no ORM, just a Flask app that reads files from the
+# filesystem and serves them up to the frontend. The pipeline runs (orchestrator.py)
+# write their output to evaluation/<app_id>/ and this reads those results.
+#
+# The dashboard shows:
+#   - Which apps have successfully completed a pipeline run
+#   - The detailed stage-by-stage log for each app
+#   - Before/after metrics: CVEs, test counts, and coverage percentages
+#
+# Routes:
+#   /              - the dashboard HTML page
+#   /apps          - JSON list of available apps (clean runs vs incomplete)
+#   /status/<id>   - JSON pipeline stage log for a specific app
+#   /report/<id>   - JSON before/after metrics for a specific app
+#   /download/<id>/<kind> - download a zip of the app's code or report
+#                    (kind is one of "old-code", "new-code", "report")
+
+import os
+import re
+import io
+import sys
+import glob
+import json
+import zipfile
+from flask import Flask, jsonify, render_template, send_file
+
+app = Flask(__name__)
+
+# ------------------------------------------------------------------
+# Path configuration - everything is relative to where this file lives
+# ------------------------------------------------------------------
+
+# Get the directory containing this script - we use this as our base
+# for constructing all other paths
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# The parent directory contains the evaluation/ folder where pipeline
+# results are stored, plus other project components
+PARENT_DIR = os.path.join(SCRIPT_DIR, "..")
+
+# Each app gets its own subfolder under evaluation/ with all its results
+EVAL_ROOT = os.path.join(PARENT_DIR, "evaluation")   # evaluation/<app_id>/...
+
+
+# The original showcase report from App5 - kept as a fallback for the
+# reference app in case the evaluation/ copy isn't available
+SHOWCASE_PATH = os.path.join(SCRIPT_DIR, "reports", "showcase_report.json")  # original App5 snapshot
+
+# We need functions from the evaluation report generator to parse
+# vulnerability counts, coverage data, and test statistics
+sys.path.insert(0, SCRIPT_DIR)
+from generate_evaluation_report import count_vulnerabilities, get_jacoco_totals, parse_test_count
+
+# -----------------------------------------------------------
+# App display names - make the dropdown more user-friendly
+# -----------------------------------------------------------
+
+# Each app has an internal ID (like "app7-h2crud") that's used everywhere
+# in the code, but we display friendlier names in the UI. If an app isn't
+# in this dictionary, we just title-case its ID and use that instead.
+APP_LABELS = {
+    "reference-run": "Reference — spring-petclinic-rest",
+    "app7-h2crud": "App7 — h2crud",
+    "app9-crudh2": "App9 — crudh2",
+    "app10-example": "App10 — example",
+    "app12-rafsan": "App12 — rafsan",
+    "app13-vicky": "App13 — vicky",
+    "app11-atomize": "App11 — atomize",
+    "app8-restdemo": "App8 — restdemo",
+    "app4-vulnerable": "App4 — vulnerable",
+    "app3-sample-rest": "App3 — sample-rest",
+    "app2-petclinic-old": "App2 — petclinic-old",
+}
+
+# ------------------------------------------------------------------
+# Pipeline completion criteria
+# ------------------------------------------------------------------
+
+# To consider a pipeline run "complete" and successful, the last stage
+# logged must contain both of these strings. This ensures we only show
+# runs that actually made it through the entire pipeline, not ones that
+# crashed or were interrupted midway.
+# Currently the final stage is named "Final full test suite + coverage"
+# so this matches both "final" and "coverage". If the stage name ever
+# changes, it needs to update these hints.
+TERMINAL_STAGE_HINTS = ("final", "coverage")
+
+# OpenRewrite sometimes outputs a line like "Estimated time saved: 7h 49m"
+# during the migration phase. We extract this to display in the dashboard
+# as an interesting metric, but it's optional - not every run has it.
+TIME_SAVED_RE = re.compile(r"stimate[d]?\s+time\s+saved:\s*((?:\d+h\s*)?\d+m)", re.IGNORECASE)
+
+
+# ------------------------------------------------------------------
+# Helper functions - these do the actual file reading and data parsing
+# ------------------------------------------------------------------
+
+def _extract_time_saved(stages):
+    # OpenRewrite sometimes logs how much time it estimates it saved.
+    # We look for that in the migration stage details. Not every run has
+    # this, so it just returns None if it can't find it rather than guessing.
+    for s in stages or []:
+        m = TIME_SAVED_RE.search(s.get("details") or "")
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _stages_report_path(app_id):
+    # Figure out which pipeline_report.json to use for this app.
+    # We prefer the per-run copy under evaluation/, then fall back to the
+    # snapshot in agents/reports/. For the reference app only, we also
+    # check the original showcase file. Returns None if nothing exists yet.
+    candidates = [
+        os.path.join(EVAL_ROOT, app_id, "pipeline_report.json"),
+        os.path.join(SCRIPT_DIR, "reports", f"pipeline_report_{app_id}.json"),
+    ]
+    if app_id == "reference-run":
+        candidates.append(SHOWCASE_PATH)
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _load_stages(app_id):
+    # Reads the pipeline stages for one app. Returns None if there's no
+    # report yet (normal - just means this app hasn't been run), or if the
+    # file is broken or half-written. We don't want a bad file to crash
+    # the dashboard, so we treat any read error as "no data".
+    path = _stages_report_path(app_id)
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("stages", [])
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[app.py] Could not read {path}: {e}")
+        return None
+
+
+def _is_clean(stages):
+    # A run is clean only if every stage succeeded AND the pipeline made
+    # it all the way to the end. If any stage failed or the run stopped
+    # early, we don't consider it complete enough to show in the dashboard.
+    if not stages:
+        return False
+    if not all(s.get("success") for s in stages):
+        return False
+    last = stages[-1].get("stage", "").lower()
+    return all(hint in last for hint in TERMINAL_STAGE_HINTS)
+
+
+def _discover_app_ids():
+    # Find every app that we have data for by looking at folder names
+    # under evaluation/ and any pipeline_report_<app>.json snapshots in
+    # agents/reports/. Returns a sorted list of app ID strings.
+    ids = set()
+    if os.path.isdir(EVAL_ROOT):
+        for name in os.listdir(EVAL_ROOT):
+            if os.path.isdir(os.path.join(EVAL_ROOT, name)):
+                ids.add(name)
+    for path in glob.glob(os.path.join(SCRIPT_DIR, "reports", "pipeline_report_app*.json")):
+        m = re.search(r"pipeline_report_(app[\w-]+)\.json$", os.path.basename(path))
+        if m:
+            ids.add(m.group(1))
+    return sorted(ids)
+
+
+def _label_for(app_id):
+    # Convert an app ID like "app7-h2crud" into something nicer for the
+    # dropdown. Use the mapping from APP_LABELS if available, otherwise
+    # clean up the ID and title-case it.
+    return APP_LABELS.get(app_id, app_id.replace("-", " ").replace("_", " ").title())
+
+
+
+def _get_stage_detail_from(stages, stage_name):
+    # Find a stage by its exact name and return its detail text.
+    # Returns None if that stage wasn't reached in this run.
+    for s in stages or []:
+        if s.get("stage") == stage_name:
+            return s.get("details")
+    return None
+
+
+def _validate_app_id(app_id):
+    """Reject any app_id not in the known set, closing off path traversal
+    via crafted URLs like /status/../../../../etc."""
+    if app_id != "reference-run" and app_id not in _discover_app_ids():
+        return False
+    return True
+
+
+# ------------------------------------------------------------------
+# Download support - locating code snapshots and report artifacts,
+# and zipping them up on the fly for the dashboard's download buttons.
+# ------------------------------------------------------------------
+
+# Folders we never want to bundle into a code download - build output,
+# VCS metadata, and IDE/dependency caches. These can be huge and add
+# nothing useful to a "here's the code" download.
+_ZIP_SKIP_DIRS = {".git", "target", "node_modules", ".idea", "__pycache__", ".venv"}
+
+
+def _old_code_dir(app_id):
+    # The reference app has a dedicated "before" snapshot (legacy-app-baseline/,
+    # captured before the pipeline ever touched it). The validation apps under
+    # target-apps/ were originally run in place with no baseline kept, so for
+    # those we fall back to target-apps-baseline/<app_id>/ - a from-scratch
+    # re-clone of each app's original public GitHub repo (source URLs logged
+    # in agents/run_batch.py / dev-history/logs/batch_summary.txt), which is
+    # byte-for-byte what the pipeline would have seen on a fresh checkout.
+    # If neither exists for a given app_id, this correctly returns None.
+    if app_id == "reference-run":
+        path = os.path.join(PARENT_DIR, "legacy-app-baseline")
+    else:
+        path = os.path.join(PARENT_DIR, "target-apps-baseline", app_id)
+    return path if os.path.isdir(path) else None
+
+
+def _new_code_dir(app_id):
+    # The "after" / current code. For the reference app that's legacy-app/;
+    # for every validation app it's their folder under target-apps/.
+    if app_id == "reference-run":
+        path = os.path.join(PARENT_DIR, "legacy-app")
+    else:
+        path = os.path.join(PARENT_DIR, "target-apps", app_id)
+    return path if os.path.isdir(path) else None
+
+
+def _report_files(app_id):
+    # Collect whichever report artifacts actually exist for this app:
+    # the pipeline stage report plus the before/after vulnerability and
+    # coverage files. Returns a list of (arcname, absolute_path) pairs
+    # for whatever is present - missing files are just skipped, same
+    # spirit as the /report route tolerating partial data.
+    eval_dir = os.path.join(EVAL_ROOT, app_id)
+    files = []
+    for name in ("vulnerabilities_before.json", "vulnerabilities_after.json",
+                 "coverage_before.xml", "coverage_after.xml"):
+        path = os.path.join(eval_dir, name)
+        if os.path.exists(path):
+            files.append((name, path))
+    report_path = _stages_report_path(app_id)
+    if report_path:
+        files.append(("pipeline_report.json", report_path))
+    return files
+
+
+def _zip_directory(dir_path):
+    # Zip an entire directory tree into an in-memory buffer, skipping the
+    # noisy folders in _ZIP_SKIP_DIRS. Kept in memory (not written to disk)
+    # since these are one-off downloads served straight back to the browser.
+    buf = io.BytesIO()
+    root_name = os.path.basename(os.path.normpath(dir_path))
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for current_dir, subdirs, files in os.walk(dir_path):
+            subdirs[:] = [d for d in subdirs if d not in _ZIP_SKIP_DIRS]
+            for fname in files:
+                abspath = os.path.join(current_dir, fname)
+                arcname = os.path.join(root_name, os.path.relpath(abspath, dir_path))
+                zf.write(abspath, arcname)
+    buf.seek(0)
+    return buf
+
+
+def _zip_files(named_paths):
+    # Zip a flat list of (arcname, absolute_path) pairs - used for report
+    # downloads, which are a handful of loose JSON/XML files rather than
+    # a directory tree.
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for arcname, path in named_paths:
+            zf.write(path, arcname)
+    buf.seek(0)
+    return buf
+
+
+# ------------------------------------------------------------------
+# Flask routes - the actual web endpoints
+# ------------------------------------------------------------------
+
+@app.route("/")
+def index():
+    # just serves the dashboard page itself
+    return render_template("index.html")
+
+
+@app.route("/apps")
+def apps():
+    # Build the list of apps for the dropdown. Apps only count as
+    # "included" if their most recent run was a full, clean pass.
+    # Anything else (no data, failed run, incomplete run) goes into
+    # "excluded" so the UI doesn't show broken results.
+    included, excluded = [], []
+    for app_id in _discover_app_ids():
+        stages = _load_stages(app_id)
+        if stages is None:
+            excluded.append({"id": app_id, "reason": "no pipeline report found"})
+            continue
+        if _is_clean(stages):
+            included.append({"id": app_id, "label": _label_for(app_id)})
+        else:
+            excluded.append({"id": app_id, "reason": "last recorded run is not a clean pass"})
+    # Put the reference app first (it's the showcase), then sort the rest alphabetically
+    included.sort(key=lambda a: (a["id"] != "reference-run", a["id"]))
+    return jsonify({"apps": included, "excluded": excluded})
+
+
+@app.route("/status/<app_id>")
+def status(app_id):
+   # Return the stage-by-stage log for one app. The UI uses this to
+    # animate the pipeline schematic. If no report exists, return a 404
+    # with empty stages so the UI can show a friendly "no data" state.
+    if not _validate_app_id(app_id):
+        return jsonify({"status": "unavailable", "stages": []}), 404
+    stages = _load_stages(app_id)
+    if stages is None:
+        return jsonify({"status": "unavailable", "stages": []}), 404
+    return jsonify({"status": "done", "stages": stages})
+
+
+@app.route("/report/<app_id>")
+def report(app_id):
+    # Return the before/after headline numbers for one app: CVE counts,
+    # test counts, and coverage. This pulls from several separate files,
+    # so if one of them is missing or broken we still return whatever
+    # we have rather than crashing the whole response.
+    if not _validate_app_id(app_id):
+        return jsonify({"available": False, "error": "unknown app_id"}), 404
+    eval_dir = os.path.join(EVAL_ROOT, app_id)
+    try:
+        stages = _load_stages(app_id) or []
+
+        vulns_before = count_vulnerabilities(os.path.join(eval_dir, "vulnerabilities_before.json"))
+        vulns_after = count_vulnerabilities(os.path.join(eval_dir, "vulnerabilities_after.json"))
+        cov_before = get_jacoco_totals(os.path.join(eval_dir, "coverage_before.xml"))
+        cov_after = get_jacoco_totals(os.path.join(eval_dir, "coverage_after.xml"))
+
+        tests_before, fail_before = parse_test_count(_get_stage_detail_from(stages, "Baseline test count"))
+        tests_after, fail_after = parse_test_count(_get_stage_detail_from(stages, "Final full test suite + coverage"))
+        if tests_after is None:
+            # some runs' full-suite stage logs don't carry the normalized
+            # "Tests: N, Failures: N" summary line (it's buried in raw
+            # Maven output instead) - fall back to the Final test count
+            # stage, which always carries it
+            tests_after, fail_after = parse_test_count(_get_stage_detail_from(stages, "Final test count"))
+        time_saved = _extract_time_saved(stages)
+
+        return jsonify({
+            "available": True,
+            "vulns_before": vulns_before, "vulns_after": vulns_after,
+            "tests_before": tests_before, "fail_before": fail_before,
+            "tests_after": tests_after, "fail_after": fail_after,
+            "time_saved": time_saved,
+            "coverage_before": cov_before.get("LINE") if cov_before else None,
+            "coverage_after": cov_after.get("LINE") if cov_after else None,
+            # Tells the UI which download buttons to enable for this app.
+            # old_code is only ever true for the reference app - see
+            # _old_code_dir's comment for why the validation apps don't have one.
+            "downloads": {
+                "old_code": _old_code_dir(app_id) is not None,
+                "new_code": _new_code_dir(app_id) is not None,
+                "report": bool(_report_files(app_id)),
+            },
+        })
+    except (OSError, json.JSONDecodeError) as e:
+       # A data file for this app exists but couldn't be read - maybe it
+        # was only half-written, or got corrupted somehow. Tell the UI
+        # clearly what happened instead of letting it hit a raw Flask error page.
+        print(f"[app.py] /report/{app_id} failed: {e}")
+        return jsonify({"available": False, "error": str(e)}), 500
+
+
+@app.route("/download/<app_id>/<kind>")
+def download(app_id, kind):
+    # Serves a zip download for one app's code or report artifacts.
+    # kind is one of "old-code", "new-code", "report". Reuses the same
+    # _validate_app_id guard as /status and /report to close off path
+    # traversal via a crafted app_id.
+    if not _validate_app_id(app_id):
+        return jsonify({"error": "unknown app_id"}), 404
+
+    if kind == "old-code":
+        code_dir = _old_code_dir(app_id)
+        if not code_dir:
+            return jsonify({
+                "error": "no baseline (pre-migration) code was retained for this app"
+            }), 404
+        buf = _zip_directory(code_dir)
+        filename = f"{app_id}-old-code.zip"
+
+    elif kind == "new-code":
+        code_dir = _new_code_dir(app_id)
+        if not code_dir:
+            return jsonify({"error": "no code found for this app"}), 404
+        buf = _zip_directory(code_dir)
+        filename = f"{app_id}-new-code.zip"
+
+    elif kind == "report":
+        report_files = _report_files(app_id)
+        if not report_files:
+            return jsonify({"error": "no report artifacts found for this app"}), 404
+        buf = _zip_files(report_files)
+        filename = f"{app_id}-report.zip"
+
+    else:
+        return jsonify({"error": "unknown download kind"}), 404
+
+    return send_file(buf, mimetype="application/zip", as_attachment=True, download_name=filename)
+
+
+# Old routes with no app ID in the URL - kept around so nothing that
+# links to them breaks. They just point at the reference app (App5).
+@app.route("/status")
+def status_default():
+    return status("reference-run")
+
+
+@app.route("/report")
+def report_default():
+    return report("reference-run")
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5001))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
